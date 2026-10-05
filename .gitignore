@@ -1,0 +1,4 @@
+*.o
+sim
+debug/
+submission.zip
