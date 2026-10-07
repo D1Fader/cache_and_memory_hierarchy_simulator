@@ -64,7 +64,7 @@ void Cache::request(uint32_t addr, char rw){
       }
 
       //Step 2: Bring in new block, update LRU
-      if(next) next->request(block_address << index_bits, 'r'); //Does next level cache have it? or main memory
+      if(next) next->request(block_address << offset_bits, 'r'); //Does next level cache have it? or main memory
       
       victim.valid = true;
       victim.dirty = false;
@@ -205,7 +205,11 @@ int main (int argc, char *argv[]) {
 
 
    // BUILD MEMORY HIERARCHY 
-   Cache L1(params.L1_SIZE, params.L1_ASSOC, params.BLOCKSIZE, NULL);
+   Cache* L2 = NULL;
+   if(params.L2_SIZE > 0){
+      L2 = new Cache(params.L2_SIZE, params.L2_ASSOC, params.BLOCKSIZE, NULL);
+   }
+   Cache L1(params.L1_SIZE, params.L1_ASSOC, params.BLOCKSIZE, L2);
 
    // HANLDE REQUESTS
    while (fscanf(fp, "%c %x\n", &rw, &addr) == 2) {	// Stay in the loop if fscanf() successfully parsed two tokens as specified.
@@ -226,10 +230,29 @@ int main (int argc, char *argv[]) {
     //////////////////////////////////////////////////////////
     L1.print_contents("L1");
     printf("\n");
+    if(L2){
+      L2->print_contents("L2");
+      printf("\n");
+    }
 
-    // Phase 1: no L2, no prefetcher -> those measurements are 0.
-    uint32_t traffic = L1.read_misses + L1.write_misses + L1.writebacks;   // b + d + f + g
+    // Phase 2: include L2, no prefetcher 
     double   l1_miss_rate = (double)(L1.read_misses + L1.write_misses) / (L1.reads + L1.writes);
+    // L2 measurements (all 0 when there is no L2).
+    uint32_t l2_reads = 0, l2_read_misses = 0, l2_writes = 0, l2_write_misses = 0, l2_writebacks = 0;
+    double   l2_miss_rate = 0.0;
+    if (L2) {
+       l2_reads        = L2->reads;
+       l2_read_misses  = L2->read_misses;
+       l2_writes       = L2->writes;
+       l2_write_misses = L2->write_misses;
+       l2_writebacks   = L2->writebacks;
+       l2_miss_rate    = (double) l2_read_misses / l2_reads;     // n = i / h
+    }
+
+    // Memory traffic = blocks moved to/from main memory, counted at the last level.
+    uint32_t traffic;
+    if (L2) traffic = l2_read_misses + l2_write_misses + l2_writebacks;      // i + k + m + o + p
+    else    traffic = L1.read_misses + L1.write_misses + L1.writebacks;      // b + d + f + g
 
     printf("===== Measurements =====\n");
     printf("a. L1 reads:                   %u\n", L1.reads);
@@ -239,16 +262,18 @@ int main (int argc, char *argv[]) {
     printf("e. L1 miss rate:               %.4f\n", l1_miss_rate);
     printf("f. L1 writebacks:              %u\n", L1.writebacks);
     printf("g. L1 prefetches:              %u\n", 0);
-    printf("h. L2 reads (demand):          %u\n", 0);
-    printf("i. L2 read misses (demand):    %u\n", 0);
+    printf("h. L2 reads (demand):          %u\n", l2_reads);
+    printf("i. L2 read misses (demand):    %u\n", l2_read_misses);
     printf("j. L2 reads (prefetch):        %u\n", 0);
     printf("k. L2 read misses (prefetch):  %u\n", 0);
-    printf("l. L2 writes:                  %u\n", 0);
-    printf("m. L2 write misses:            %u\n", 0);
-    printf("n. L2 miss rate:               %.4f\n", 0.0);
-    printf("o. L2 writebacks:              %u\n", 0);
+    printf("l. L2 writes:                  %u\n", l2_writes);
+    printf("m. L2 write misses:            %u\n", l2_write_misses);
+    printf("n. L2 miss rate:               %.4f\n", l2_miss_rate);
+    printf("o. L2 writebacks:              %u\n", l2_writebacks);
     printf("p. L2 prefetches:              %u\n", 0);
     printf("q. memory traffic:             %u\n", traffic);
+
+    delete L2;
 
     return(0);
 }
