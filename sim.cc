@@ -17,13 +17,18 @@ static uint32_t log2u(uint32_t x) {
 }
 
 // Implement Cache Constructor uppon declaration 
-Cache::Cache(uint32_t size, uint32_t assoc, uint32_t blocksize, Cache *next){
+Cache::Cache(uint32_t size, uint32_t assoc, uint32_t blocksize, Cache *next,
+uint32_t pref_n, uint32_t pref_m){
    this->assoc = assoc;
    this->next = next; 
    num_sets = size / (blocksize * assoc);
    offset_bits = log2u(blocksize);
    index_bits = log2u(num_sets);
    sets.assign(num_sets, std::vector<block_t>(assoc));
+
+   this->pref_m = pref_m;
+   sbs.assign(pref_n, stream_buffer_t());
+   for (uint32_t s = 0; s < pref_n; s++) sbs[s].lru = s; //N stream buffers ranked 0..N-1
 }
 
 // Address    |      tag      |    index    |  offset |
@@ -36,7 +41,7 @@ void Cache::request(uint32_t addr, char rw){
    u_int32_t tag = block_address >> index_bits; 
    std::vector<block_t>&set = sets[index]; // create a reference, used to update conents
 
-   // Search INDIVIDUAL set for a hit, search each way
+   // CACHE SEARCH: Search INDIVIDUAL set for a hit, search each way
    int way = -1;
    for (uint32_t w = 0; w < assoc; w++){
       if (set[w].valid  && set[w].tag == tag){
@@ -44,11 +49,18 @@ void Cache::request(uint32_t addr, char rw){
          break;
       }
    }
+   // Did we hit in the Cache? 
+   bool cache_hit = (way >= 0);
 
-   // MISS 
-   if(way < 0){
-      if(is_write) write_misses++; else read_misses++;
+   // BUFFER SEARCH
+   int sb = find_sb_hit(block_address);
 
+   // CACHE MISS - even if hits in stream buffer, still has to be installed
+   if(!cache_hit){
+      // A "miss" means the block is in neither the cache nor a stream buffer
+      if(sb < 0){
+         if(is_write) write_misses++; else read_misses++;
+      }
       //Step 1: Make room for new block - choose who to evict(LRU)
       way = (int)find_victim(index);
       block_t &victim = set[way]; 
@@ -64,7 +76,8 @@ void Cache::request(uint32_t addr, char rw){
       }
 
       //Step 2: Bring in new block, update LRU
-      if(next) next->request(block_address << offset_bits, 'r'); //Does next level cache have it? or main memory
+      //only go to next level cache/mem if SB misses too
+      if(sb < 0 && next) next->request(block_address << offset_bits, 'r'); //Does next level cache have it? or main memory
       
       victim.valid = true;
       victim.dirty = false;
@@ -76,6 +89,12 @@ void Cache::request(uint32_t addr, char rw){
    // UPDATE LRU AND DIRTY (IF WRITE)
    if(is_write) set[way].dirty = true;
    update_lru(index, uint32_t(way));
+
+   //Stream Buffer Management 
+   if(sb >= 0)
+      sb_advance((uint32_t)sb, block_address); // scenarios #2 and #4: continue the stream
+   else if(!cache_hit && !sbs.empty()) // check - do we have buffers enabled?
+      sb_new_stream(block_address); // scenario #1
 }
 
 
@@ -115,6 +134,88 @@ void Cache::print_contents(const char* name){
       printf("\n");
    }
 }
+
+
+
+/////////////////////////////////////////////////////////
+///////////////////SB IMPLEMENTATION//////////////////
+/////////////////////////////////////////////////////////
+
+
+// Return the MRU stream buffer that contains block_addr, or -1 if none does.
+int Cache::find_sb_hit(uint32_t block_addr){
+   int best = -1;
+   for (uint32_t s = 0; s < sbs.size(); s++){
+      const stream_buffer_t& b = sbs[s];
+      if (b.valid && block_addr >= b.head && block_addr < b.head + pref_m){
+         if(best < 0 || b.lru < sbs[best].lru) best = (int) s; // lowest LRU counter -> MRU
+      }
+   }
+   return best;
+}
+
+// Scenario 1 - replace LRU stream buffer with X+1...X+M
+void Cache::sb_new_stream(uint32_t block_addr){
+   uint32_t s = 0; 
+   for (uint32_t i = 1; i < sbs.size(); i++){
+      if(sbs[i].lru > sbs[s].lru) s = i; //find LRU buffer rank
+   }
+   sbs[s].valid = true; 
+   sbs[s].head = block_addr + 1;
+   prefetches += pref_m; 
+
+   sb_make_mru(s);
+}
+
+void Cache::sb_advance(uint32_t s, uint32_t block_addr){
+   uint32_t new_head = block_addr + 1;
+   prefetches += new_head - sbs[s].head;
+   sbs[s].head = new_head;
+   sb_make_mru(s);
+}
+
+void Cache::sb_make_mru(uint32_t s){
+   uint32_t old = sbs[s].lru;
+   for (uint32_t i = 0; i < sbs.size(); i++){
+      if (i != s && sbs[i].lru < old) sbs[i].lru++;
+   }
+   sbs[s].lru = 0; // Make MRU, set counter to 0
+}
+
+
+// Print valid stream buffers MRU -> LRU, each as M block addresses.
+void Cache::print_stream_buffers() {
+   printf("===== Stream Buffer(s) contents =====\n");
+   std::vector<const stream_buffer_t *> order;
+   for (const stream_buffer_t &b : sbs)
+      if (b.valid) order.push_back(&b);
+   std::sort(order.begin(), order.end(),
+             [](const stream_buffer_t *a, const stream_buffer_t *b) { return a->lru < b->lru; });
+   for (const stream_buffer_t *b : order) {
+      for (uint32_t k = 0; k < pref_m; k++)
+         printf("%8x ", b->head + k);
+      printf("\n");
+   }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -207,9 +308,9 @@ int main (int argc, char *argv[]) {
    // BUILD MEMORY HIERARCHY 
    Cache* L2 = NULL;
    if(params.L2_SIZE > 0){
-      L2 = new Cache(params.L2_SIZE, params.L2_ASSOC, params.BLOCKSIZE, NULL);
+      L2 = new Cache(params.L2_SIZE, params.L2_ASSOC, params.BLOCKSIZE, NULL, params.PREF_N, params.PREF_M);
    }
-   Cache L1(params.L1_SIZE, params.L1_ASSOC, params.BLOCKSIZE, L2);
+   Cache L1(params.L1_SIZE, params.L1_ASSOC, params.BLOCKSIZE, L2, L2 ? 0 : params.PREF_N, L2 ? 0 : params.PREF_M);
 
    // HANLDE REQUESTS
    while (fscanf(fp, "%c %x\n", &rw, &addr) == 2) {	// Stay in the loop if fscanf() successfully parsed two tokens as specified.
@@ -234,11 +335,17 @@ int main (int argc, char *argv[]) {
       L2->print_contents("L2");
       printf("\n");
     }
+    if (params.PREF_N > 0){
+      Cache *last = L2 ? L2 : &L1;
+      last->print_stream_buffers();
+      printf("\n");
+    }
 
     // Phase 2: include L2, no prefetcher 
     double   l1_miss_rate = (double)(L1.read_misses + L1.write_misses) / (L1.reads + L1.writes);
     // L2 measurements (all 0 when there is no L2).
     uint32_t l2_reads = 0, l2_read_misses = 0, l2_writes = 0, l2_write_misses = 0, l2_writebacks = 0;
+    uint32_t l2_prefetches = 0;
     double   l2_miss_rate = 0.0;
     if (L2) {
        l2_reads        = L2->reads;
@@ -246,13 +353,14 @@ int main (int argc, char *argv[]) {
        l2_writes       = L2->writes;
        l2_write_misses = L2->write_misses;
        l2_writebacks   = L2->writebacks;
+       l2_prefetches   = L2->prefetches;
        l2_miss_rate    = (double) l2_read_misses / l2_reads;     // n = i / h
     }
 
     // Memory traffic = blocks moved to/from main memory, counted at the last level.
     uint32_t traffic;
-    if (L2) traffic = l2_read_misses + l2_write_misses + l2_writebacks;      // i + k + m + o + p
-    else    traffic = L1.read_misses + L1.write_misses + L1.writebacks;      // b + d + f + g
+    if (L2) traffic = l2_read_misses + l2_write_misses + l2_writebacks + l2_prefetches;      // i + k + m + o + p
+    else    traffic = L1.read_misses + L1.write_misses + L1.writebacks + L1.prefetches;      // b + d + f + g
 
     printf("===== Measurements =====\n");
     printf("a. L1 reads:                   %u\n", L1.reads);
@@ -261,7 +369,7 @@ int main (int argc, char *argv[]) {
     printf("d. L1 write misses:            %u\n", L1.write_misses);
     printf("e. L1 miss rate:               %.4f\n", l1_miss_rate);
     printf("f. L1 writebacks:              %u\n", L1.writebacks);
-    printf("g. L1 prefetches:              %u\n", 0);
+    printf("g. L1 prefetches:              %u\n", L1.prefetches);
     printf("h. L2 reads (demand):          %u\n", l2_reads);
     printf("i. L2 read misses (demand):    %u\n", l2_read_misses);
     printf("j. L2 reads (prefetch):        %u\n", 0);
@@ -270,7 +378,7 @@ int main (int argc, char *argv[]) {
     printf("m. L2 write misses:            %u\n", l2_write_misses);
     printf("n. L2 miss rate:               %.4f\n", l2_miss_rate);
     printf("o. L2 writebacks:              %u\n", l2_writebacks);
-    printf("p. L2 prefetches:              %u\n", 0);
+    printf("p. L2 prefetches:              %u\n", l2_prefetches);
     printf("q. memory traffic:             %u\n", traffic);
 
     delete L2;
