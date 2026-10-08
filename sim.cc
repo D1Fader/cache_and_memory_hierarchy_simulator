@@ -341,7 +341,7 @@ int main (int argc, char *argv[]) {
       printf("\n");
     }
 
-    // Phase 2: include L2, no prefetcher 
+    // Phase 3: L2 + prefetching optioins  
     double   l1_miss_rate = (double)(L1.read_misses + L1.write_misses) / (L1.reads + L1.writes);
     // L2 measurements (all 0 when there is no L2).
     uint32_t l2_reads = 0, l2_read_misses = 0, l2_writes = 0, l2_write_misses = 0, l2_writebacks = 0;
